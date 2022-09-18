@@ -1,55 +1,133 @@
 
-import os
-import threading
-from sqlalchemy import create_engine
-from sqlalchemy import Column, TEXT, Numeric
-from sqlalchemy.ext.declarative import declarative_base
-from config import DB_URI
-from sqlalchemy.orm import sessionmaker, scoped_session
+import pymongo
 
-def start() -> scoped_session:
-    engine = create_engine(DB_URI, client_encoding="utf8")
-    BASE.metadata.bind = engine
-    BASE.metadata.create_all(engine)
-    return scoped_session(sessionmaker(bind=engine, autoflush=False))
+from info import DATABASE_URI, DATABASE_NAME
+
+import logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.ERROR)
+
+myclient = pymongo.MongoClient(DATABASE_URI)
+mydb = myclient[DATABASE_NAME]
+mycol = mydb['CONNECTION']   
 
 
-BASE = declarative_base()
-SESSION = start()
+async def add_connection(group_id, user_id):
+    query = mycol.find_one(
+        { "_id": user_id },
+        { "_id": 0, "active_group": 0 }
+    )
+    if query is not None:
+        group_ids = [x["group_id"] for x in query["group_details"]]
+        if group_id in group_ids:
+            return False
 
-INSERTION_LOCK = threading.RLock()
+    group_details = {
+        "group_id" : group_id
+    }
 
-class Broadcast(BASE):
-    __tablename__ = "broadcast"
-    id = Column(Numeric, primary_key=True)
-    user_name = Column(TEXT)
+    data = {
+        '_id': user_id,
+        'group_details' : [group_details],
+        'active_group' : group_id,
+    }
 
-    def __init__(self, id, user_name):
-        self.id = id
-        self.user_name = user_name
+    if mycol.count_documents( {"_id": user_id} ) == 0:
+        try:
+            mycol.insert_one(data)
+            return True
+        except:
+            logger.exception('Some error occurred!', exc_info=True)
 
-Broadcast.__table__.create(checkfirst=True)
+    else:
+        try:
+            mycol.update_one(
+                {'_id': user_id},
+                {
+                    "$push": {"group_details": group_details},
+                    "$set": {"active_group" : group_id}
+                }
+            )
+            return True
+        except:
+            logger.exception('Some error occurred!', exc_info=True)
+
+        
+async def active_connection(user_id):
+
+    query = mycol.find_one(
+        { "_id": user_id },
+        { "_id": 0, "group_details": 0 }
+    )
+    if not query:
+        return None
+
+    group_id = query['active_group']
+    return int(group_id) if group_id != None else None
 
 
-#  Add user details -
-async def add_user(id, user_name):
-    with INSERTION_LOCK:
-        msg = SESSION.query(Broadcast).get(id)
-        if not msg:
-            usr = Broadcast(id, user_name)
-            SESSION.add(usr)
-            SESSION.commit()
-        else:
-            pass
-          
-async def full_userbase():
-    users = SESSION.query(Broadcast).all()
-    SESSION.close()
-    return users
+async def all_connections(user_id):
+    query = mycol.find_one(
+        { "_id": user_id },
+        { "_id": 0, "active_group": 0 }
+    )
+    if query is not None:
+        return [x["group_id"] for x in query["group_details"]]
+    else:
+        return None
 
-async def query_msg():
+
+async def if_active(user_id, group_id):
+    query = mycol.find_one(
+        { "_id": user_id },
+        { "_id": 0, "group_details": 0 }
+    )
+    return query is not None and query['active_group'] == group_id
+
+
+async def make_active(user_id, group_id):
+    update = mycol.update_one(
+        {'_id': user_id},
+        {"$set": {"active_group" : group_id}}
+    )
+    return update.modified_count != 0
+
+
+async def make_inactive(user_id):
+    update = mycol.update_one(
+        {'_id': user_id},
+        {"$set": {"active_group" : None}}
+    )
+    return update.modified_count != 0
+
+
+async def delete_connection(user_id, group_id):
+
     try:
-        query = SESSION.query(Broadcast.id).order_by(Broadcast.id)
-        return query
-    finally:
-        SESSION.close()
+        update = mycol.update_one(
+            {"_id": user_id},
+            {"$pull" : { "group_details" : {"group_id":group_id} } }
+        )
+        if update.modified_count == 0:
+            return False
+        query = mycol.find_one(
+            { "_id": user_id },
+            { "_id": 0 }
+        )
+        if len(query["group_details"]) >= 1:
+            if query['active_group'] == group_id:
+                prvs_group_id = query["group_details"][len(query["group_details"]) - 1]["group_id"]
+
+                mycol.update_one(
+                    {'_id': user_id},
+                    {"$set": {"active_group" : prvs_group_id}}
+                )
+        else:
+            mycol.update_one(
+                {'_id': user_id},
+                {"$set": {"active_group" : None}}
+            )
+        return True
+    except Exception as e:
+        logger.exception(f'Some error occurred! {e}', exc_info=True)
+        return False
